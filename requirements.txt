@@ -1,0 +1,19 @@
+# LiveKit Agents — agentic voice pipeline framework
+livekit-agents>=1.5.17
+livekit-plugins-sarvam>=1.5.17
+livekit-plugins-openai>=1.5.17
+livekit-plugins-silero>=1.5.17
+livekit>=1.1.8
+
+# MCP — Model Context Protocol
+mcp[cli]>=1.0.0
+fastmcp>=0.1.0
+
+# Google Calendar
+google-auth>=2.0.0
+google-auth-oauthlib>=1.0.0
+google-auth-httplib2>=0.1.0
+google-api-python-client>=2.0.0
+
+# Utilities
+python-dotenv>=1.0.0

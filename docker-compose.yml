@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+
+  # LiveKit server — real-time audio infrastructure
+  livekit:
+    image: livekit/livekit-server:latest
+    container_name: livekit
+    ports:
+      - "7880:7880"       # HTTP/WebSocket API
+      - "7881:7881"       # RTC over TCP
+      - "7882:7882/udp"   # RTC over UDP (WebRTC audio)
+    environment:
+      - LIVEKIT_KEYS=${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}
+    command: --bind 0.0.0.0 --dev
+    restart: unless-stopped
+
+  # MCP server — exposes Google Calendar tools
+  mcp-server:
+    build: .
+    container_name: mcp-server
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./token.json:/app/token.json        # Google OAuth token
+      - ./credentials.json:/app/credentials.json
+    environment:
+      - LIVEKIT_URL=${LIVEKIT_URL}
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+    command: python mcp_server.py
+    restart: unless-stopped
+    depends_on:
+      - livekit
+
+  # Agent worker — voice pipeline
+  agent:
+    build: .
+    container_name: agent
+    volumes:
+      - ./token.json:/app/token.json
+      - ./credentials.json:/app/credentials.json
+    environment:
+      - LIVEKIT_URL=${LIVEKIT_URL}
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - SARVAM_API_KEY=${SARVAM_API_KEY}
+      - MCP_URL=http://mcp-server:9000/sse
+    command: python agent.py start
+    restart: unless-stopped
+    depends_on:
+      - livekit
+      - mcp-server
+
+  # FastAPI server — creates agent rooms
+  server:
+    build: .
+    container_name: server
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./token.json:/app/token.json
+      - ./credentials.json:/app/credentials.json
+    environment:
+      - LIVEKIT_URL=${LIVEKIT_URL}
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      - MCP_URL=http://mcp-server:9000/sse
+    command: uvicorn server:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+    depends_on:
+      - livekit
+      - mcp-server
