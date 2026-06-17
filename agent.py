@@ -1,33 +1,13 @@
 """
 Voice Agent — AI Receptionist
-Built with LiveKit Agents (agentic AI framework) + MCP + Sarvam AI
-
-Architecture:
-    Caller speaks
-        → LiveKit captures audio
-        → Sarvam STT (saaras:v3) converts voice to text
-        → GPT-4o-mini (LLM) reads text, decides what to do
-        → If tool needed: calls MCP server (calendar tools)
-        → LLM generates reply text
-        → Sarvam TTS (bulbul:v3) converts text to voice
-        → Caller hears the response
-
-Key frameworks used:
-    - LiveKit Agents: agentic voice pipeline framework
-    - MCP (Model Context Protocol): standardised tool calling protocol
-    - FastMCP: Python MCP server implementation
-    - Sarvam AI: Indian language STT + TTS
-    - Silero VAD: voice activity detection
-
-Run order:
-    1. python mcp_server.py      (start MCP tool server)
-    2. python agent.py dev       (start agent worker)
-    3. python agent.py console   (test via text/mic)
+Built with LiveKit Agents + Sarvam AI + Google Calendar
 """
 
 import os
 import json
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 from livekit.agents import (
@@ -36,12 +16,14 @@ from livekit.agents import (
     JobContext,
     WorkerOptions,
     cli,
+    function_tool,
+    RunContext,
 )
-from livekit.agents.llm.mcp import MCPServerHTTP, MCPToolset
 from livekit.plugins import silero, openai
 from livekit.plugins import sarvam
 
-from prompts import DENTAL_CLINIC_PROMPT, DEFAULT_PROMPT
+from prompts import DENTAL_CLINIC_PROMPT
+from tools.calendar import _check_availability_sync, _book_appointment_sync
 
 load_dotenv()
 
@@ -51,30 +33,80 @@ logging.basicConfig(
 )
 logger = logging.getLogger("voice-agent")
 
+# Dedicated thread pool for calendar I/O
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="calendar")
+
+
+class DentalReceptionist(Agent):
+
+    def __init__(self, instructions: str):
+        super().__init__(instructions=instructions)
+
+    @function_tool()
+    async def check_availability_tool(
+        self,
+        context: RunContext,
+        date: str,
+    ) -> str:
+        """
+        Check available appointment slots for a given date at Sharma Dental Clinic.
+
+        Args:
+            date: Date in YYYY-MM-DD format e.g. 2026-06-16
+        """
+        import asyncio
+        logger.info(f"🔧 check_availability_tool ENTERED: date={date}")
+        print(f"\n🔧 check_availability_tool ENTERED: date={date}", flush=True)
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(_executor, _check_availability_sync, date)
+
+        logger.info(f"✅ check_availability_tool RESULT: {result}")
+        print(f"✅ check_availability_tool RESULT: {result}", flush=True)
+        return result
+
+    @function_tool()
+    async def book_appointment_tool(
+        self,
+        context: RunContext,
+        caller_name: str,
+        service: str,
+        start_time: str,
+        end_time: str,
+    ) -> str:
+        """
+        Book a dental appointment for the caller on Google Calendar.
+        Always call check_availability_tool first before booking.
+
+        Args:
+            caller_name: Full name of the patient e.g. Shivansh Malhotra
+            service: Dental service e.g. Regular checkup
+            start_time: ISO 8601 start time e.g. 2026-06-16T16:00:00+05:30
+            end_time: ISO 8601 end time e.g. 2026-06-16T16:30:00+05:30
+        """
+        import asyncio
+        logger.info(f"🔧 book_appointment_tool ENTERED: {caller_name} | {service} | {start_time}")
+        print(f"\n🔧 book_appointment_tool ENTERED: {caller_name} | {service} | {start_time}", flush=True)
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            _executor, _book_appointment_sync, caller_name, service, start_time, end_time
+        )
+
+        logger.info(f"✅ book_appointment_tool RESULT: {result}")
+        print(f"✅ book_appointment_tool RESULT: {result}", flush=True)
+        return result
+
 
 async def entrypoint(ctx: JobContext):
-    """
-    Main agent entrypoint — called by LiveKit when a caller joins a room.
-
-    Each room has metadata containing:
-    - system_prompt: instructions for this specific agent/client
-    - speaker: which Sarvam voice to use (priya, rahul, neha etc.)
-    - mcp_url: which MCP server to connect to for tools
-
-    This allows one codebase to serve multiple clients —
-    each with their own prompt, voice, and tools.
-    """
-
     await ctx.connect()
     logger.info(f"Connected to room: {ctx.room.name}")
 
-    # ─── Step 1: Load configuration from room metadata ───────────────────────
     try:
         meta = json.loads(ctx.room.metadata or '{}')
     except Exception:
         meta = {}
 
-    # Fallback to job metadata (LiveKit Cloud console testing)
     if not meta.get('system_prompt'):
         try:
             meta = json.loads(ctx.job.metadata or '{}')
@@ -83,71 +115,37 @@ async def entrypoint(ctx: JobContext):
 
     system_prompt = meta.get('system_prompt') or DENTAL_CLINIC_PROMPT
     speaker       = meta.get('speaker', 'priya')
-    mcp_url       = meta.get('mcp_url') or os.getenv('MCP_URL', 'http://localhost:9000/sse')
 
-    logger.info(f"Speaker: {speaker} | MCP: {mcp_url}")
+    logger.info(f"Speaker: {speaker}")
     logger.info(f"Prompt preview: {system_prompt[:80]}...")
 
-    # ─── Step 2: Connect to MCP tool server ──────────────────────────────────
-    # MCPToolset connects to mcp_server.py
-    # LLM discovers tools automatically and calls them during conversation
-    tools = []
-    try:
-        mcp_toolset = MCPToolset(
-            id="dental-tools",
-            mcp_server=MCPServerHTTP(url=mcp_url),
-        )
-        tools.append(mcp_toolset)
-        logger.info(f"MCP toolset connected: {mcp_url}")
-    except Exception as e:
-        logger.error(f"MCP connection failed: {e} — agent will run without tools")
-
-    # ─── Step 3: Build the voice session ─────────────────────────────────────
     session = AgentSession(
-
-        # VAD — detects when caller starts/stops speaking
         vad=silero.VAD.load(),
-
-        # STT — Sarvam saaras:v3 — best for Indian languages + Hinglish
         stt=sarvam.STT(
             model="saaras:v3",
             language="en-IN",
             mode="codemix",
             flush_signal=True,
         ),
-
-        # LLM — brain of the agent
-        # Uses OpenAI function calling to invoke MCP tools
         llm=openai.LLM(model="gpt-4o-mini"),
-
-        # TTS — Sarvam bulbul:v3 — natural Indian voice
         tts=sarvam.TTS(
             model="bulbul:v3",
             target_language_code="en-IN",
             speaker=speaker,
             pace=1.1,
         ),
-
     )
 
-    # ─── Step 4: Start the agent session ─────────────────────────────────────
     await session.start(
         room=ctx.room,
-        agent=Agent(
-            instructions=system_prompt,
-            tools=tools,
-        ),
+        agent=DentalReceptionist(instructions=system_prompt),
     )
 
-    # ─── Step 5: Greet the caller ─────────────────────────────────────────────
     await session.generate_reply(
         instructions=(
             "Greet the caller warmly. "
             "Tell them they have reached Sharma Dental Clinic. "
-            "Ask how you can help. "
-            "Speak naturally like a human receptionist. "
-            "Never read out code, variable names, IDs, or technical terms. "
-            "When tools return results, interpret them conversationally."
+            "Ask how you can help."
         )
     )
 

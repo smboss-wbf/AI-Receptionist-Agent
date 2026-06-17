@@ -15,25 +15,7 @@ services:
     command: --bind 0.0.0.0 --dev
     restart: unless-stopped
 
-  # MCP server — exposes Google Calendar tools
-  mcp-server:
-    build: .
-    container_name: mcp-server
-    ports:
-      - "9000:9000"
-    volumes:
-      - ./token.json:/app/token.json        # Google OAuth token
-      - ./credentials.json:/app/credentials.json
-    environment:
-      - LIVEKIT_URL=${LIVEKIT_URL}
-      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
-      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
-    command: python mcp_server.py
-    restart: unless-stopped
-    depends_on:
-      - livekit
-
-  # Agent worker — voice pipeline
+  # Agent worker — voice pipeline (calls Google Calendar directly, no MCP)
   agent:
     build: .
     container_name: agent
@@ -46,19 +28,17 @@ services:
       - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - SARVAM_API_KEY=${SARVAM_API_KEY}
-      - MCP_URL=http://mcp-server:9000/sse
     command: python agent.py start
     restart: unless-stopped
     depends_on:
       - livekit
-      - mcp-server
 
-  # FastAPI server — creates agent rooms
+  # FastAPI server — creates agent rooms (called by n8n)
   server:
     build: .
     container_name: server
     ports:
-      - "8000:8000"
+      - "8001:8001"
     volumes:
       - ./token.json:/app/token.json
       - ./credentials.json:/app/credentials.json
@@ -66,9 +46,7 @@ services:
       - LIVEKIT_URL=${LIVEKIT_URL}
       - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
       - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
-      - MCP_URL=http://mcp-server:9000/sse
-    command: uvicorn server:app --host 0.0.0.0 --port 8000
+    command: uvicorn server:app --host 0.0.0.0 --port 8001
     restart: unless-stopped
     depends_on:
       - livekit
-      - mcp-server

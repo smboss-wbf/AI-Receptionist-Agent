@@ -1,7 +1,7 @@
 # 🎙️ AI Receptionist
 
 AI-powered voice receptionist that books appointments via natural conversation.
-Built with **LiveKit Agents** + **MCP** + **Sarvam AI** — optimised for Indian languages and clients.
+Built with **LiveKit Agents** + **Sarvam AI** — optimised for Indian languages and clients.
 
 ## Demo
 
@@ -21,22 +21,22 @@ Priya:  "Done! Your checkup is confirmed for Monday at 10am. See you then!"
 | Layer | Technology | Why |
 |-------|-----------|-----|
 | Voice pipeline | LiveKit Agents | Open source, self-hostable, no per-minute fee |
-| Tool protocol | MCP (Model Context Protocol) | Standard tool calling — add tools without changing agent |
-| MCP server | FastMCP | Lightweight Python MCP server |
+| Tools | Direct Python function tools | Reliable — avoids MCP SSE session issues on Windows |
 | STT | Sarvam saaras:v3 | Best Indian language transcription, ~₹0.50/min |
 | TTS | Sarvam bulbul:v3 | Natural Indian voices, ~₹0.25/min |
-| LLM | OpenAI GPT-4o-mini | Fast, cheap, reliable |
+| LLM | OpenAI GPT-4o | Fast, reliable function-calling |
 | VAD | Silero | Detects when caller speaks/stops |
 | Calendar | Google Calendar API | Books appointments directly |
+| Multi-client | LiveKit room metadata | Per-client prompt/voice, one worker serves all |
 
 ## Cost per minute (Indian stack)
 
 | Component | Cost |
 |-----------|------|
 | Sarvam STT + TTS | ₹0.75/min |
-| GPT-4o-mini | ₹0.80/min |
+| GPT-4o | ₹1.50/min |
 | LiveKit (self-hosted) | ₹0.00/min |
-| **Total** | **~₹2.55/min** |
+| **Total** | **~₹2.25–3.50/min** |
 
 ## Architecture
 
@@ -44,11 +44,26 @@ Priya:  "Done! Your checkup is confirmed for Monday at 10am. See you then!"
 Caller speaks
     → Silero VAD detects speech
     → Sarvam STT (saaras:v3) → text
-    → GPT-4o-mini decides what to do
-    → MCP tool called (Google Calendar)
-    → GPT-4o-mini generates reply
+    → GPT-4o decides what to do
+    → Calendar tool called directly (no MCP, runs in ThreadPoolExecutor)
+    → GPT-4o generates reply
     → Sarvam TTS (bulbul:v3) → voice
     → Caller hears response
+```
+
+## Multi-client architecture
+
+One `agent.py` worker serves unlimited clients. Each client's config (system
+prompt, voice, clinic name) lives in the LiveKit room's metadata, set at room
+creation time by `server.py` (called from n8n or any HTTP client).
+
+```
+n8n / Dashboard
+    → POST /create-agent  {agent_name, voice_gender, knowledge_file}
+    → server.py creates a LiveKit room with metadata
+    → returns room_name
+    → caller joins room (via token from /get-token)
+    → agent.py reads room.metadata and configures itself per-call
 ```
 
 ## Project Structure
@@ -57,12 +72,11 @@ Caller speaks
 ai-receptionist/
 ├── agent.py              ← Voice pipeline (LiveKit Agents)
 ├── server.py             ← FastAPI (creates agent rooms)
-├── mcp_server.py         ← MCP server (exposes tools)
-├── prompts.py            ← System prompts (dynamic date)
+├── prompts.py             ← System prompts (dynamic date)
 ├── setup_google_auth.py  ← Google OAuth (run once)
 ├── tools/
 │   ├── __init__.py
-│   └── calendar.py       ← Google Calendar functions
+│   └── calendar.py       ← Google Calendar functions (sync + executor)
 ├── Dockerfile
 ├── docker-compose.yml
 ├── Makefile
@@ -104,16 +118,26 @@ make build
 make up
 ```
 
+This starts 3 containers: `livekit`, `agent`, `server`.
+
 ### 5. Test
 ```bash
 # Check health
-curl http://localhost:8000/health
+curl http://localhost:8001/health
 
-# Create an agent
-curl -X POST http://localhost:8000/create-agent \
+# Create an agent room
+curl -X POST http://localhost:8001/create-agent \
   -H "Content-Type: application/json" \
-  -d '{"agent_name": "Priya", "agent_type": "Receptionist", "voice_gender": "Female"}'
+  -d '{"agent_name": "Priya", "agent_type": "Receptionist", "voice_gender": "Female", "knowledge_file": ""}'
+
+# Get a caller token (use room_name from above)
+curl -X POST http://localhost:8001/get-token \
+  -H "Content-Type: application/json" \
+  -d '{"room_name": "agent-xxxxxxxx", "participant_name": "test-caller"}'
 ```
+
+Then open `https://agents-playground.livekit.io`, paste the token + LiveKit
+URL, and talk to the agent.
 
 ## Local Development (without Docker)
 
@@ -124,13 +148,13 @@ pip install -r requirements.txt
 # Google auth (one time)
 python setup_google_auth.py
 
-# Terminal 1 — MCP tools server
-python mcp_server.py
-
-# Terminal 2 — Agent worker
+# Terminal 1 — Agent worker
 python agent.py dev
 
-# Terminal 3 — Test via mic
+# Terminal 2 — FastAPI server
+uvicorn server:app --host 0.0.0.0 --port 8001 --reload
+
+# Terminal 3 — Test via mic (no server needed)
 python agent.py console
 ```
 
@@ -143,16 +167,33 @@ python agent.py console
 | `LIVEKIT_API_SECRET` | LiveKit API secret (min 32 chars) |
 | `OPENAI_API_KEY` | OpenAI API key |
 | `SARVAM_API_KEY` | Sarvam AI API key |
-| `MCP_URL` | MCP server SSE endpoint |
 
 ## Adding New Tools
 
-1. Add a function to `tools/calendar.py` (or create a new file in `tools/`)
-2. Register it in `mcp_server.py` with `@mcp.tool()`
-3. Restart the MCP server
-4. Update the system prompt in `prompts.py` to mention the new tool
+1. Add a sync function to `tools/calendar.py` (e.g. `_cancel_appointment_sync`)
+2. Add a matching `@function_tool()` async method inside the `DentalReceptionist`
+   class in `agent.py`, calling it via `loop.run_in_executor(_executor, fn, ...)`
+3. Restart `agent.py`
+4. Update the system prompt in `prompts.py` to mention the new tool and its rules
 
-No changes to `agent.py` needed — MCP handles tool discovery automatically.
+No MCP server to manage — tools are plain Python methods on the Agent class.
+
+## Per-client configuration (multi-tenant)
+
+Every client gets a unique LiveKit room created via `POST /create-agent`.
+The request body becomes the room's metadata, which `agent.py` reads at the
+start of each call:
+
+```json
+{
+  "agent_name": "Priya",
+  "voice_gender": "Female",
+  "knowledge_file": "You are Priya, receptionist at Sharma Dental Clinic..."
+}
+```
+
+`server.py` also accepts `system_prompt` instead of `knowledge_file` (used by
+the n8n "Build Prompt" node), so either field name works.
 
 ## Deployment (Hostinger VPS)
 
