@@ -24,8 +24,8 @@ COPY . .
 RUN python -m livekit.agents download-files
 
 # Expose FastAPI server port
-EXPOSE 8000
+EXPOSE 8001
 
-# Default command — runs both MCP server and agent worker
-# Override with docker-compose for separate services
+# Default command — runs the agent worker
+# docker-compose overrides this per-service (agent vs server)
 CMD ["python", "agent.py", "start"]

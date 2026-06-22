@@ -1,0 +1,6 @@
+log_level: info
+api_key: devkey-webuildflows-local
+api_secret: secret-webuildflows-local-32chars-min
+ws_url: ws://livekit:7880
+redis:
+  address: redis:6379

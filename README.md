@@ -1,217 +1,232 @@
-# 🎙️ AI Receptionist
+# 🎙️ AI Receptionist — Self-Hosted Telephony (Docker)
 
-AI-powered voice receptionist that books appointments via natural conversation.
-Built with **LiveKit Agents** + **Sarvam AI** — optimised for Indian languages and clients.
-
-## Demo
-
-```
-Caller: "Hi, I want to book a checkup"
-Priya:  "Of course! May I know your name please?"
-Caller: "Rahul Sharma"
-Priya:  "What service do you need, Rahul?"
-Caller: "Regular checkup this Monday at 10am"
-Priya:  "Monday is available at 10am. Shall I confirm a 30-minute checkup?"
-Caller: "Yes please"
-Priya:  "Done! Your checkup is confirmed for Monday at 10am. See you then!"
-```
+AI-powered voice receptionist that answers real phone calls and books
+appointments via natural conversation. Fully self-hosted: LiveKit server,
+LiveKit SIP (telephony bridge), and Redis all run in your own Docker
+containers — no LiveKit Cloud, no per-minute managed SIP fees.
 
 ## Tech Stack
 
-| Layer | Technology | Why |
-|-------|-----------|-----|
-| Voice pipeline | LiveKit Agents | Open source, self-hostable, no per-minute fee |
-| Tools | Direct Python function tools | Reliable — avoids MCP SSE session issues on Windows |
-| STT | Sarvam saaras:v3 | Best Indian language transcription, ~₹0.50/min |
-| TTS | Sarvam bulbul:v3 | Natural Indian voices, ~₹0.25/min |
-| LLM | OpenAI GPT-4o | Fast, reliable function-calling |
-| VAD | Silero | Detects when caller speaks/stops |
-| Calendar | Google Calendar API | Books appointments directly |
-| Multi-client | LiveKit room metadata | Per-client prompt/voice, one worker serves all |
-
-## Cost per minute (Indian stack)
-
-| Component | Cost |
-|-----------|------|
-| Sarvam STT + TTS | ₹0.75/min |
-| GPT-4o | ₹1.50/min |
-| LiveKit (self-hosted) | ₹0.00/min |
-| **Total** | **~₹2.25–3.50/min** |
+| Layer | Technology |
+|-------|-----------|
+| Voice pipeline | LiveKit Agents (self-hosted server) |
+| Telephony bridge | LiveKit SIP (self-hosted, built from source) |
+| Coordination | Redis (required by LiveKit SIP) |
+| STT | Sarvam saaras:v3 |
+| TTS | Sarvam bulbul:v3 |
+| LLM | OpenAI GPT-4o |
+| VAD | Silero |
+| Calendar | Google Calendar API (OAuth, token.json) |
 
 ## Architecture
 
 ```
-Caller speaks
-    → Silero VAD detects speech
-    → Sarvam STT (saaras:v3) → text
-    → GPT-4o decides what to do
-    → Calendar tool called directly (no MCP, runs in ThreadPoolExecutor)
-    → GPT-4o generates reply
-    → Sarvam TTS (bulbul:v3) → voice
-    → Caller hears response
+Phone call (SIP client or real carrier via a trunk provider)
+    → livekit-sip     (translates phone audio into LiveKit's format)
+    → livekit          (manages the room where caller + agent meet)
+    → agent            (your AI receptionist — STT, LLM, TTS, calendar tools)
 ```
 
-## Multi-client architecture
-
-One `agent.py` worker serves unlimited clients. Each client's config (system
-prompt, voice, clinic name) lives in the LiveKit room's metadata, set at room
-creation time by `server.py` (called from n8n or any HTTP client).
-
-```
-n8n / Dashboard
-    → POST /create-agent  {agent_name, voice_gender, knowledge_file}
-    → server.py creates a LiveKit room with metadata
-    → returns room_name
-    → caller joins room (via token from /get-token)
-    → agent.py reads room.metadata and configures itself per-call
-```
+All five services run as Docker containers: `redis`, `livekit`,
+`livekit-sip`, `agent`, `server`.
 
 ## Project Structure
 
 ```
 ai-receptionist/
-├── agent.py              ← Voice pipeline (LiveKit Agents)
-├── server.py             ← FastAPI (creates agent rooms)
-├── prompts.py             ← System prompts (dynamic date)
-├── setup_google_auth.py  ← Google OAuth (run once)
+├── agent.py                  ← Voice pipeline (LiveKit Agents)
+├── server.py                 ← FastAPI (creates agent rooms)
+├── prompts.py                 ← System prompts
+├── setup_google_auth.py      ← Google OAuth (run once, generates token.json)
+├── setup_sip_trunk.sh        ← One-time SIP trunk + dispatch rule setup
+├── livekit-config.yaml       ← livekit-server config (Redis-backed)
+├── sip-config.yaml           ← livekit-sip config
 ├── tools/
 │   ├── __init__.py
-│   └── calendar.py       ← Google Calendar functions (sync + executor)
-├── Dockerfile
+│   └── calendar.py           ← Google Calendar functions (token.json based)
+├── Dockerfile                ← Builds the agent/server Python image
+├── Dockerfile.sip            ← Builds livekit-sip from source
 ├── docker-compose.yml
 ├── Makefile
 ├── requirements.txt
 └── .env.example
 ```
 
-## Quick Start (Docker)
+## Quick Start (Docker — Windows, Mac, or Linux)
 
 ### Prerequisites
-- Docker + Docker Compose
-- Google Cloud project with Calendar API enabled
+- Docker Desktop installed and running
+- A Google Cloud project with Calendar API enabled and an OAuth Client ID
+  (Desktop app type) downloaded as `credentials.json`
 - OpenAI API key
 - Sarvam AI API key
+- The `lk` CLI installed on your host machine (not in Docker) — needed once
+  for the SIP trunk setup step. See https://github.com/livekit/livekit-cli
 
-### 1. Clone and setup
+### 1. Clone and configure
 ```bash
-git clone https://github.com/YOUR_USERNAME/ai-receptionist.git
+git clone <your-repo-url>
 cd ai-receptionist
-make setup
+cp .env.example .env
+# Edit .env with your OPENAI_API_KEY and SARVAM_API_KEY
 ```
 
-### 2. Configure environment
+### 2. Google Calendar OAuth (one time, run locally — NOT in Docker)
 ```bash
-# Edit .env with your API keys
-nano .env
-```
-
-### 3. Google Calendar OAuth (one time)
-```bash
-# Place credentials.json from Google Cloud Console in this folder
-make auth
-# Browser opens → sign in → token.json saved
-```
-
-### 4. Start everything
-```bash
-make build
-make up
-```
-
-This starts 3 containers: `livekit`, `agent`, `server`.
-
-### 5. Test
-```bash
-# Check health
-curl http://localhost:8001/health
-
-# Create an agent room
-curl -X POST http://localhost:8001/create-agent \
-  -H "Content-Type: application/json" \
-  -d '{"agent_name": "Priya", "agent_type": "Receptionist", "voice_gender": "Female", "knowledge_file": ""}'
-
-# Get a caller token (use room_name from above)
-curl -X POST http://localhost:8001/get-token \
-  -H "Content-Type: application/json" \
-  -d '{"room_name": "agent-xxxxxxxx", "participant_name": "test-caller"}'
-```
-
-Then open `https://agents-playground.livekit.io`, paste the token + LiveKit
-URL, and talk to the agent.
-
-## Local Development (without Docker)
-
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Google auth (one time)
+pip install google-auth-oauthlib google-api-python-client
 python setup_google_auth.py
-
-# Terminal 1 — Agent worker
-python agent.py dev
-
-# Terminal 2 — FastAPI server
-uvicorn server:app --host 0.0.0.0 --port 8001 --reload
-
-# Terminal 3 — Test via mic (no server needed)
-python agent.py console
 ```
+This opens a browser, asks you to sign in, and creates `token.json` in this
+folder. Docker Compose mounts this file into the `agent` and `server`
+containers automatically.
+
+### 3. Build and start everything
+```bash
+docker compose build
+docker compose up -d
+```
+
+This starts 5 containers: `redis`, `livekit`, `livekit-sip`, `agent`,
+`server`. Check they're all running:
+```bash
+docker compose ps
+```
+
+### 4. Create the SIP trunk and dispatch rule (one time)
+```bash
+chmod +x setup_sip_trunk.sh
+./setup_sip_trunk.sh
+```
+This requires the `lk` CLI on your host (talking to the dockerized
+`livekit-server` on `localhost:7880`). It creates:
+- An inbound SIP trunk (currently open to any address — restrict this in
+  production to your real SIP provider's IP range)
+- A dispatch rule that creates a fresh room per caller and assigns the
+  `dental-receptionist` agent to it
+
+Verify:
+```bash
+lk sip dispatch list
+```
+The `Agents` column should show `dental-receptionist`.
+
+### 5. Test with a SIP softphone
+
+Since there's no real phone number connected yet, use a SIP test client to
+simulate an inbound call. On Windows, **MicroSIP** is a good free option
+(similar role to `pjsua`/`baresip` used during Mac validation):
+
+1. Download and install [MicroSIP](https://www.microsip.org/)
+2. Skip/avoid creating any SIP account — you want a direct call, not
+   registration (the trunk has no authentication configured)
+3. Dial directly to: `sip:1234@localhost:5060` (or your Docker host's LAN
+   IP if `localhost` doesn't resolve correctly from MicroSIP)
+
+You should hear the AI receptionist greet you. Check logs if not:
+```bash
+docker compose logs -f livekit-sip
+docker compose logs -f agent
+```
+
+## What's different from the previous (non-Docker) local Mac setup
+
+The Mac validation used locally-installed binaries (`livekit-server`,
+`livekit-sip` built from source, Redis via Homebrew) across multiple
+terminal tabs. This Docker setup containerizes the exact same architecture
+so it runs identically on Windows, Linux, or Mac — `Dockerfile.sip` builds
+`livekit-sip` from source inside its container the same way it was built
+manually before, with the same native dependencies (`libopus`, `libsoxr`,
+`libopusfile`).
 
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `LIVEKIT_URL` | LiveKit server WebSocket URL |
-| `LIVEKIT_API_KEY` | LiveKit API key (min 32 chars) |
-| `LIVEKIT_API_SECRET` | LiveKit API secret (min 32 chars) |
+| `LIVEKIT_URL` | Points at the dockerized livekit-server (`ws://livekit:7880` from inside Docker) |
+| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | Must match the `keys:` section in `livekit-config.yaml` and `sip-config.yaml` exactly |
 | `OPENAI_API_KEY` | OpenAI API key |
 | `SARVAM_API_KEY` | Sarvam AI API key |
 
 ## Adding New Tools
 
-1. Add a sync function to `tools/calendar.py` (e.g. `_cancel_appointment_sync`)
-2. Add a matching `@function_tool()` async method inside the `DentalReceptionist`
-   class in `agent.py`, calling it via `loop.run_in_executor(_executor, fn, ...)`
-3. Restart `agent.py`
-4. Update the system prompt in `prompts.py` to mention the new tool and its rules
+1. Add a sync function to `tools/calendar.py`
+2. Add a matching `@function_tool()` async method inside the
+   `DentalReceptionist` class in `agent.py`, calling it via
+   `loop.run_in_executor(_executor, fn, ...)`
+3. Rebuild and restart: `docker compose up -d --build agent`
+4. Update the system prompt in `prompts.py` to mention the new tool
 
-No MCP server to manage — tools are plain Python methods on the Agent class.
+## Connecting a real phone number (Plivo)
 
-## Per-client configuration (multi-tenant)
+This setup is validated with simulated SIP calls only. Here's the actual,
+confirmed path to connect a real phone number via Plivo.
 
-Every client gets a unique LiveKit room created via `POST /create-agent`.
-The request body becomes the room's metadata, which `agent.py` reads at the
-start of each call:
+**Prerequisite:** the server must already be publicly reachable (deployed
+to a VPS, not running on a laptop) — Plivo cannot route calls to a private
+IP like `192.168.1.x`. Do the VPS deployment (see below) before this.
 
-```json
-{
-  "agent_name": "Priya",
-  "voice_gender": "Female",
-  "knowledge_file": "You are Priya, receptionist at Sharma Dental Clinic..."
-}
+### 1. Buy a number and create a Plivo inbound trunk
+1. Sign up at [plivo.com](https://www.plivo.com), add balance
+2. Go to **Phone Numbers → Buy Number**, pick an Indian number
+3. Go to **Zentrunk → Inbound Trunks → Create New Inbound Trunk**
+4. **India requirement:** if handling calls to/from India, your LiveKit
+   region must be set to India — this is a regulatory requirement, not
+   optional, calls will fail without it
+
+### 2. Point the Plivo trunk at this server
+In the trunk's destination/primary URI field, enter your server's public
+IP and port:
+```
+<your-server-public-ip>:5060;transport=tcp
 ```
 
-`server.py` also accepts `system_prompt` instead of `knowledge_file` (used by
-the n8n "Build Prompt" node), so either field name works.
+### 3. Attach the number to the trunk
+Go to **Phone Numbers → Your Numbers**, select your number, set
+**Application Type** to **Zentrunk**, and choose the trunk created above.
 
-## Deployment (Hostinger VPS)
+### 4. Lock down the LiveKit-side trunk to Plivo's real IPs
+The trunk created by `setup_sip_trunk.sh` is wide open (`0.0.0.0/0`) for
+local testing only. Once a real number is live, restrict it to Plivo's
+actual signaling IPs. Confirm which region serves your number in the Plivo
+console, then update accordingly:
+
+| Region | Signaling IP range |
+|---|---|
+| Singapore (closest to India) | `18.136.1.128/26` |
+| North California, USA | `13.52.9.0/25`, `216.120.187.128/26` |
+| Virginia, USA | `18.214.109.128/25`, `18.215.142.0/26`, `204.89.148.128/26` |
+| Frankfurt, Germany | `3.120.121.128/26` |
+| São Paulo, Brazil | `18.228.70.64/26` |
+| Sydney, Australia | `13.238.202.192/26` |
 
 ```bash
-# SSH into VPS
-ssh root@your-vps-ip
+cat > /tmp/sip-inbound-trunk-update.json << 'EOF'
+{
+  "name": "Plivo Production Trunk",
+  "allowedAddresses": ["18.136.1.128/26"]
+}
+EOF
 
-# Clone repo
-git clone https://github.com/YOUR_USERNAME/ai-receptionist.git
-cd ai-receptionist
-
-# Setup
-make setup
-# Edit .env with production keys
-make auth
-make build
-make up
+lk sip inbound update --id <your-trunk-id> /tmp/sip-inbound-trunk-update.json
 ```
+
+### 5. Ports
+Plivo signals on port **5060** (UDP/TCP) and sends media on ports
+**10000–30000** (UDP/TCP). `livekit-config.yaml` and `docker-compose.yml`
+in this project are already set to this range — confirm your VPS firewall
+opens both 5060 and 10000–30000 as well.
+
+### 6. Deploy to a VPS instead of a laptop
+1. Copy this whole project folder to your VPS (e.g. Hostinger)
+2. In `livekit-config.yaml`, set `use_external_ip: true`
+3. Run `docker compose build && docker compose up -d` on the VPS
+4. Re-run `setup_sip_trunk.sh` (or the trunk update above) against the
+   VPS's `livekit-server`
+5. Open ports 5060 and 10000–30000 in the VPS firewall
+
+### 7. Test it
+Call your new Plivo number from any phone. It should ring through to the
+AI receptionist exactly like the local softphone tests did.
 
 ## License
 

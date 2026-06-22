@@ -1,12 +1,14 @@
 """
-Voice Agent — AI Receptionist
-Built with LiveKit Agents + Sarvam AI + Google Calendar
+Voice Agent — AI Receptionist (single calendar, token.json / OAuth)
+
+Uses your own Google Calendar via token.json (see setup_google_auth.py).
+No calendar_id needed — tools/calendar.py always targets calendarId='primary'.
 """
 
 import os
 import json
 import logging
-import threading
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
@@ -33,7 +35,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("voice-agent")
 
-# Dedicated thread pool for calendar I/O
+# Dedicated thread pool for calendar I/O — avoids event-loop blocking issues
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="calendar")
 
 
@@ -49,20 +51,19 @@ class DentalReceptionist(Agent):
         date: str,
     ) -> str:
         """
-        Check available appointment slots for a given date at Sharma Dental Clinic.
+        Check available appointment slots for a given date.
 
         Args:
             date: Date in YYYY-MM-DD format e.g. 2026-06-16
         """
-        import asyncio
         logger.info(f"🔧 check_availability_tool ENTERED: date={date}")
-        print(f"\n🔧 check_availability_tool ENTERED: date={date}", flush=True)
 
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(_executor, _check_availability_sync, date)
+        result = await loop.run_in_executor(
+            _executor, _check_availability_sync, date
+        )
 
         logger.info(f"✅ check_availability_tool RESULT: {result}")
-        print(f"✅ check_availability_tool RESULT: {result}", flush=True)
         return result
 
     @function_tool()
@@ -75,18 +76,16 @@ class DentalReceptionist(Agent):
         end_time: str,
     ) -> str:
         """
-        Book a dental appointment for the caller on Google Calendar.
+        Book an appointment on the calendar.
         Always call check_availability_tool first before booking.
 
         Args:
-            caller_name: Full name of the patient e.g. Shivansh Malhotra
-            service: Dental service e.g. Regular checkup
+            caller_name: Full name of the caller e.g. Shivansh Malhotra
+            service: Service requested e.g. Regular checkup
             start_time: ISO 8601 start time e.g. 2026-06-16T16:00:00+05:30
             end_time: ISO 8601 end time e.g. 2026-06-16T16:30:00+05:30
         """
-        import asyncio
         logger.info(f"🔧 book_appointment_tool ENTERED: {caller_name} | {service} | {start_time}")
-        print(f"\n🔧 book_appointment_tool ENTERED: {caller_name} | {service} | {start_time}", flush=True)
 
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
@@ -94,7 +93,6 @@ class DentalReceptionist(Agent):
         )
 
         logger.info(f"✅ book_appointment_tool RESULT: {result}")
-        print(f"✅ book_appointment_tool RESULT: {result}", flush=True)
         return result
 
 
@@ -127,7 +125,7 @@ async def entrypoint(ctx: JobContext):
             mode="codemix",
             flush_signal=True,
         ),
-        llm=openai.LLM(model="gpt-4o-mini"),
+        llm=openai.LLM(model="gpt-4o"),
         tts=sarvam.TTS(
             model="bulbul:v3",
             target_language_code="en-IN",
@@ -144,11 +142,14 @@ async def entrypoint(ctx: JobContext):
     await session.generate_reply(
         instructions=(
             "Greet the caller warmly. "
-            "Tell them they have reached Sharma Dental Clinic. "
+            "Tell them they have reached the clinic. "
             "Ask how you can help."
         )
     )
 
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    cli.run_app(WorkerOptions(
+        entrypoint_fnc=entrypoint,
+        agent_name="dental-receptionist",  # must match the agent_name in your LiveKit SIP dispatch rule
+    ))

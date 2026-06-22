@@ -1,55 +1,42 @@
 """
-Google Calendar OAuth Setup
-Run this ONCE to generate token.json
-After that, calendar.py uses token.json automatically
+One-time Google Calendar OAuth setup.
 
-Steps:
-1. Go to console.cloud.google.com
-2. Create a project
-3. Enable Google Calendar API
-4. Create OAuth 2.0 credentials (Desktop app)
-5. Download as credentials.json
-6. Run: python setup_google_auth.py
+Run this locally (NOT in Docker) once to generate token.json.
+A browser window will open asking you to sign into the Google account
+whose Calendar the AI receptionist should use.
+
+Prerequisite: place credentials.json (downloaded from Google Cloud Console
+-> APIs & Services -> Credentials -> OAuth Client ID -> Desktop app)
+in this same folder before running this script.
+
+Usage:
+    python setup_google_auth.py
 """
 
 import os
-from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
 
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
-def setup():
-    creds = None
 
-    # Check if token already exists
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+def main():
+    if not os.path.exists('credentials.json'):
+        print("❌ credentials.json not found.")
+        print("   Download it from Google Cloud Console > APIs & Services")
+        print("   > Credentials > OAuth Client ID (type: Desktop app)")
+        print("   and place it in this folder before running this script.")
+        return
 
-    # If no valid token, run OAuth flow
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            print("Refreshing expired token...")
-            creds.refresh(Request())
-        else:
-            if not os.path.exists('credentials.json'):
-                print("ERROR: credentials.json not found!")
-                print("Download it from Google Cloud Console:")
-                print("console.cloud.google.com → APIs → OAuth 2.0 Credentials → Download")
-                return
+    flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+    creds = flow.run_local_server(port=0)
 
-            print("Opening browser for Google authentication...")
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
+    with open('token.json', 'w') as f:
+        f.write(creds.to_json())
 
-        # Save token for future use
-        with open('token.json', 'w') as f:
-            f.write(creds.to_json())
-        print("✅ token.json saved successfully!")
-        print("You can now run agent.py and mcp_server.py")
+    print("✅ token.json created successfully.")
+    print("   You can now run: python agent.py console")
+    print("   Or copy token.json into your Docker setup before running docker compose up.")
 
-    else:
-        print("✅ Token already valid — you're good to go!")
 
 if __name__ == "__main__":
-    setup()
+    main()

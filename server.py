@@ -1,14 +1,13 @@
 """
 Server — FastAPI server that creates voice agent rooms.
 
-This replaces what n8n was doing visually:
-    - Receives agent config (form data from WeBuildFlows)
-    - Builds system prompt from knowledge file
-    - Creates a LiveKit room with metadata
-    - Returns agent_id back to caller
+Accepts config from n8n HTTP Request node and creates a LiveKit room.
+agent.py dev reads the room metadata and configures itself.
 
-Run this alongside agent.py and mcp_server.py:
-    uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+Run alongside agent.py:
+    Terminal 1: python agent.py dev
+    Terminal 2: uvicorn server:app --host 0.0.0.0 --port 8001 --reload
+    Terminal 3: ngrok http 8001  (expose to n8n)
 """
 
 import os
@@ -18,6 +17,7 @@ import logging
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional, List
 from dotenv import load_dotenv
 from livekit import api
 
@@ -40,50 +40,64 @@ app.add_middleware(
 LIVEKIT_URL    = os.getenv("LIVEKIT_URL")
 LIVEKIT_KEY    = os.getenv("LIVEKIT_API_KEY")
 LIVEKIT_SECRET = os.getenv("LIVEKIT_API_SECRET")
-MCP_URL        = os.getenv("MCP_URL", "http://localhost:9000/sse")
+
+
+# ─── Speaker map ─────────────────────────────────────────────────────────────
+
+SPEAKER_MAP = {
+    "Female":  "priya",
+    "Male":    "rahul",
+    "priya":   "priya",
+    "rahul":   "rahul",
+    "neha":    "neha",
+    "ananya":  "ananya",
+    "mithali": "mithali",
+    "arjun":   "arjun",
+    "siya":    "siya",
+    "amol":    "amol",
+}
 
 
 # ─── Request model ────────────────────────────────────────────────────────────
+# Accepts both n8n field names (system_prompt) and server field names (knowledge_file)
 
 class AgentRequest(BaseModel):
-    """
-    What WeBuildFlows sends when a user fills the form.
-    Each field maps to a form input on the site.
-    """
-    agent_name:     str                    # e.g. "Priya"
-    agent_type:     str  = "Receptionist" # Receptionist, Sales, Support, Custom
-    voice_gender:   str  = "Female"       # Female or Male
-    knowledge_file: str  = ""             # Pasted knowledge base / instructions
-    mcp_url:        str  = ""             # Which MCP server to use for tools
-    # WeBuildFlows tracking fields
-    user_id:        str  = ""
-    run_id:         str  = ""
-    callback_url:   str  = ""
+    agent_name:     str                        # e.g. "Priya"
+    agent_type:     str   = "Receptionist"
+    voice_gender:   str   = "Female"           # Female / Male / exact speaker
+    speaker:        Optional[str] = None       # override voice_gender if set
+
+    # n8n sends "system_prompt", direct API sends "knowledge_file" — accept both
+    system_prompt:  Optional[str] = None
+    knowledge_file: Optional[str] = None
+
+    # n8n specific fields — accepted but not used by agent.py directly
+    tools:          Optional[List[str]] = []
+    mcp_url:        Optional[str] = ""
+    notify_email:   Optional[str] = ""
+    runId:          Optional[str] = ""
+    callback_url:   Optional[str] = ""
+    user_id:        Optional[str] = ""
 
 
-# ─── Helper: map gender to Sarvam speaker ────────────────────────────────────
+class TokenRequest(BaseModel):
+    room_name:        str
+    participant_name: str = "caller"
 
-SPEAKER_MAP = {
-    "Female": "priya",
-    "Male":   "rahul",
-}
 
-# ─── Helper: build system prompt ─────────────────────────────────────────────
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
-def build_system_prompt(request: AgentRequest) -> str:
-    """
-    Build the system prompt from the agent config.
-    This is what the n8n Build Prompt Code node was doing.
+def resolve_prompt(request: AgentRequest) -> str:
+    """Accept system_prompt (n8n) or knowledge_file (direct API), fallback to default."""
+    prompt = request.system_prompt or request.knowledge_file or ""
+    return prompt.strip() if prompt.strip() else DENTAL_CLINIC_PROMPT
 
-    If the user pasted their own knowledge file — use it directly.
-    If not — fall back to the demo dental clinic prompt.
-    """
-    if request.knowledge_file.strip():
-        # User provided their own instructions — use as-is
-        return request.knowledge_file.strip()
 
-    # No knowledge file — use default dental demo prompt
-    return DENTAL_CLINIC_PROMPT
+def resolve_speaker(request: AgentRequest) -> str:
+    """Accept explicit speaker name or map from voice_gender."""
+    if request.speaker and request.speaker in SPEAKER_MAP:
+        return SPEAKER_MAP[request.speaker]
+    return SPEAKER_MAP.get(request.voice_gender, "priya")
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
@@ -91,40 +105,23 @@ def build_system_prompt(request: AgentRequest) -> str:
 @app.post("/create-agent")
 async def create_agent(request: AgentRequest):
     """
-    Create a voice agent for a client.
-
-    Steps:
-    1. Map voice gender to Sarvam speaker name
-    2. Build system prompt from knowledge file
-    3. Create a LiveKit room with all config in metadata
-    4. Return room name (agent_id) to WeBuildFlows
-
-    The LiveKit room name = agent_id.
-    When a caller joins this room, agent.py picks it up
-    and reads the metadata to configure itself.
+    Called by n8n HTTP Request node after Build Prompt node.
+    Creates a LiveKit room with agent config in metadata.
+    agent.py dev picks it up automatically.
     """
     try:
-        # Step 1 — map voice to speaker
-        speaker = SPEAKER_MAP.get(request.voice_gender, "priya")
+        speaker       = resolve_speaker(request)
+        system_prompt = resolve_prompt(request)
+        room_name     = f"agent-{uuid.uuid4().hex[:8]}"
 
-        # Step 2 — build system prompt
-        system_prompt = build_system_prompt(request)
-
-        # Step 3 — determine MCP URL
-        mcp_url = request.mcp_url or MCP_URL
-
-        # Step 4 — create unique room name
-        room_name = f"agent-{uuid.uuid4().hex[:8]}"
-
-        # Step 5 — create LiveKit room with metadata
-        # agent.py reads this metadata when a caller joins
+        # Everything agent.py needs is in this metadata JSON
         metadata = json.dumps({
             "system_prompt": system_prompt,
             "speaker":       speaker,
-            "mcp_url":       mcp_url,
             "agent_type":    request.agent_type,
             "agent_name":    request.agent_name,
-            "user_id":       request.user_id,
+            "notify_email":  request.notify_email,
+            "user_id":       request.user_id or request.runId,
         })
 
         lk = api.LiveKitAPI(
@@ -132,74 +129,121 @@ async def create_agent(request: AgentRequest):
             api_key=LIVEKIT_KEY,
             api_secret=LIVEKIT_SECRET,
         )
-
         await lk.room.create_room(
             api.CreateRoomRequest(
                 name=room_name,
                 metadata=metadata,
-                empty_timeout=86400,  # room expires after 24hrs if unused
+                empty_timeout=86400,
             )
         )
-
         await lk.aclose()
 
-        logger.info(f"Created room {room_name} for agent '{request.agent_name}'")
+        logger.info(f"✅ Room created: {room_name} | Agent: {request.agent_name} | Speaker: {speaker}")
 
-        return {
+        response = {
             "status":     "success",
             "agent_id":   room_name,
+            "room_name":  room_name,
             "agent_name": request.agent_name,
-            "agent_type": request.agent_type,
             "speaker":    speaker,
-            "mcp_url":    mcp_url,
-            "message":    f"Agent '{request.agent_name}' is live and ready.",
+            "livekit_url": LIVEKIT_URL,
+            "message":    f"Agent '{request.agent_name}' is ready. Room: {room_name}",
         }
+
+        return response
 
     except Exception as e:
         logger.error(f"Error creating agent: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/get-token")
+async def get_token(request: TokenRequest):
+    """
+    Generate a LiveKit access token for a caller to join the room.
+    Call this after /create-agent to get the join token.
+    """
+    try:
+        token = api.AccessToken(LIVEKIT_KEY, LIVEKIT_SECRET)
+        token.with_identity(request.participant_name)
+        token.with_name(request.participant_name)
+        token.with_grants(api.VideoGrants(
+            room_join=True,
+            room=request.room_name,
+            can_publish=True,
+            can_subscribe=True,
+        ))
+        jwt = token.to_jwt()
+
+        return {
+            "status":      "success",
+            "token":       jwt,
+            "room_name":   request.room_name,
+            "livekit_url": LIVEKIT_URL,
+        }
+
+    except Exception as e:
+        logger.error(f"Error generating token: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.delete("/delete-agent/{room_name}")
 async def delete_agent(room_name: str):
-    """
-    Delete a room when the agent is no longer needed.
-    Call this when a client cancels their subscription.
-    """
+    """Delete a room when the agent session ends."""
     try:
         lk = api.LiveKitAPI(
             url=LIVEKIT_URL,
             api_key=LIVEKIT_KEY,
             api_secret=LIVEKIT_SECRET,
         )
-        await lk.room.delete_room(
-            api.DeleteRoomRequest(room=room_name)
-        )
+        await lk.room.delete_room(api.DeleteRoomRequest(room=room_name))
         await lk.aclose()
+        return {"status": "success", "message": f"Room {room_name} deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-        logger.info(f"Deleted room {room_name}")
-        return {"status": "success", "message": f"Agent {room_name} deleted"}
 
+@app.get("/list-agents")
+async def list_agents():
+    """List all active agent rooms — useful for your dashboard."""
+    try:
+        lk = api.LiveKitAPI(
+            url=LIVEKIT_URL,
+            api_key=LIVEKIT_KEY,
+            api_secret=LIVEKIT_SECRET,
+        )
+        rooms = await lk.room.list_rooms(api.ListRoomsRequest())
+        await lk.aclose()
+        return {
+            "status": "success",
+            "count": len(rooms.rooms),
+            "agents": [
+                {
+                    "room_name":        r.name,
+                    "num_participants": r.num_participants,
+                    "config": json.loads(r.metadata) if r.metadata else {},
+                }
+                for r in rooms.rooms
+            ]
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "livekit_url": LIVEKIT_URL,
-        "mcp_url": MCP_URL,
-    }
+    return {"status": "ok", "livekit_url": LIVEKIT_URL}
 
 
 @app.get("/")
 def root():
     return {
-        "message": "WeBuildFlows Voice Agent Server",
+        "service": "WeBuildFlows Voice Agent Server",
         "endpoints": {
-            "POST /create-agent": "Create a new voice agent room",
-            "DELETE /delete-agent/{room_name}": "Delete an agent room",
-            "GET /health": "Health check",
+            "POST /create-agent":             "Create agent room (called by n8n)",
+            "POST /get-token":                "Get caller token for a room",
+            "DELETE /delete-agent/{room}":    "Delete agent room",
+            "GET /list-agents":               "List all active rooms",
+            "GET /health":                    "Health check",
         }
     }

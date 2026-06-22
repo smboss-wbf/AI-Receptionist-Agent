@@ -5,7 +5,7 @@ livekit-plugins-openai>=1.5.17
 livekit-plugins-silero>=1.5.17
 livekit>=1.1.8
 
-# Google Calendar
+# Google Calendar (OAuth via token.json)
 google-auth>=2.0.0
 google-auth-oauthlib>=1.0.0
 google-auth-httplib2>=0.1.0

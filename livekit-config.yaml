@@ -1,0 +1,18 @@
+port: 7880
+rtc:
+  tcp_port: 7881
+  # Widened to overlap with Plivo's media port range (10000-30000).
+  # If using a different SIP provider, check their required range and
+  # adjust accordingly — this just needs to cover whatever your provider sends.
+  port_range_start: 10000
+  port_range_end: 30000
+  use_external_ip: false   # set to true when deployed on a VPS with a public IP
+
+redis:
+  address: redis:6379
+
+keys:
+  devkey-webuildflows-local: secret-webuildflows-local-32chars-min
+
+logging:
+  level: info

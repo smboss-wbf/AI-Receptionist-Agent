@@ -2,30 +2,62 @@ version: '3.8'
 
 services:
 
-  # LiveKit server — real-time audio infrastructure
+  # Redis — required coordination layer between livekit-server and livekit-sip
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # LiveKit server — manages rooms, participants, audio routing
   livekit:
     image: livekit/livekit-server:latest
     container_name: livekit
     ports:
       - "7880:7880"       # HTTP/WebSocket API
       - "7881:7881"       # RTC over TCP
-      - "7882:7882/udp"   # RTC over UDP (WebRTC audio)
-    environment:
-      - LIVEKIT_KEYS=${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}
-    command: --bind 0.0.0.0 --dev
+      - "10000-30000:10000-30000/udp"   # RTC media (RTP) port range — matches Plivo's range
+    volumes:
+      - ./livekit-config.yaml:/livekit.yaml
+    command: --config /livekit.yaml
     restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
 
-  # Agent worker — voice pipeline (calls Google Calendar directly, no MCP)
+  # LiveKit SIP — translates real/simulated phone calls into LiveKit rooms
+  # Built from source — see Dockerfile.sip
+  livekit-sip:
+    build:
+      context: .
+      dockerfile: Dockerfile.sip
+    container_name: livekit-sip
+    ports:
+      - "5060:5060/udp"   # SIP signaling
+      - "5060:5060/tcp"   # SIP signaling (TCP fallback)
+    volumes:
+      - ./sip-config.yaml:/app/config.yaml
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+
+  # Agent worker — voice pipeline (your existing AI receptionist, unchanged)
   agent:
     build: .
     container_name: agent
     volumes:
       - ./token.json:/app/token.json
-      - ./credentials.json:/app/credentials.json
     environment:
-      - LIVEKIT_URL=${LIVEKIT_URL}
-      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
-      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      - LIVEKIT_URL=ws://livekit:7880
+      - LIVEKIT_API_KEY=devkey-webuildflows-local
+      - LIVEKIT_API_SECRET=secret-webuildflows-local-32chars-min
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - SARVAM_API_KEY=${SARVAM_API_KEY}
     command: python agent.py start
@@ -33,7 +65,7 @@ services:
     depends_on:
       - livekit
 
-  # FastAPI server — creates agent rooms (called by n8n)
+  # FastAPI server — creates agent rooms (called by n8n or any HTTP client)
   server:
     build: .
     container_name: server
@@ -41,11 +73,10 @@ services:
       - "8001:8001"
     volumes:
       - ./token.json:/app/token.json
-      - ./credentials.json:/app/credentials.json
     environment:
-      - LIVEKIT_URL=${LIVEKIT_URL}
-      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
-      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      - LIVEKIT_URL=ws://livekit:7880
+      - LIVEKIT_API_KEY=devkey-webuildflows-local
+      - LIVEKIT_API_SECRET=secret-webuildflows-local-32chars-min
     command: uvicorn server:app --host 0.0.0.0 --port 8001
     restart: unless-stopped
     depends_on:

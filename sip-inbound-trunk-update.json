@@ -1,0 +1,4 @@
+{
+  "name": "Local Test Inbound Trunk",
+  "allowedAddresses": ["192.168.1.0/24"]
+}

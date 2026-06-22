@@ -1,6 +1,10 @@
 """
 Google Calendar tools for the AI Receptionist.
 Uses run_in_executor to avoid blocking the LiveKit async event loop.
+
+Single-calendar setup: authenticates as you, via token.json (OAuth).
+Run setup_google_auth.py once locally to generate token.json before
+using this in Docker — then mount that file into the container.
 """
 
 import os
